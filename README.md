@@ -61,9 +61,9 @@ Below is the simple execution flow for this solution, which you may deploy with 
 
 1.	The source data is ingested into Amazon S3.  
 2.	At a scheduled interval, an AWS Glue Workflow will execute, and perform the below activities:  
-⋅⋅1. Trigger an AWS Glue Crawler to automatically discover and update the schema of the source data.  
-⋅⋅2. Upon a successful completion of the Crawler, run an [ETL job](flatten_join_nested_file.py), which will use the AWS Glue `Relationalize` transform to optimize the data format. When a data structure includes arrays, the relationalize transform extract these as separate tables and adds all the necessary keys to join back to the parent table. This job also loops through the tables and standardizes the table and column names. Optionally, it also joins the columns together in a wide, fully denormalized table.  
-⋅⋅3. As a final step, it loads the data into an Amazon Redshift Cluster, and also into an Amazon S3 data lake in columnar file format, Apache Parquet.  
+a) Trigger an AWS Glue Crawler to automatically discover and update the schema of the source data.  
+b) Upon a successful completion of the Crawler, run an [ETL job](flatten_join_nested_file.py), which will use the AWS Glue `Relationalize` transform to optimize the data format. When a data structure includes arrays, the relationalize transform extract these as separate tables and adds all the necessary keys to join back to the parent table. This job also loops through the tables and standardizes the table and column names. Optionally, it also joins the columns together in a wide, fully denormalized table.  
+c) As a final step, it loads the data into an Amazon Redshift Cluster, and also into an Amazon S3 data lake in columnar file format, Apache Parquet.  
 3.	Now, we can visualize the data in Redshift or Athena with simple SQL queries.  
 
 
