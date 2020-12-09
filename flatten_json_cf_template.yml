@@ -1,0 +1,909 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates Redshift Cluster
+
+Parameters:
+  S3ScriptBucketName:
+    Type: String
+    Description: Non existing Amazon S3 Bucket to be used to store workshop scripts
+    AllowedPattern: (?!^(\d{1,3}\.){3}\d{1,3}$)(^[a-z0-9]([a-z0-9-]*(\.[a-z0-9])?)*$)
+    Default: 'scripts'
+  S3DataBucketName:
+    Type: String
+    Description: Non existing Amazon S3 Bucket to be used to store workshop data
+    AllowedPattern: (?!^(\d{1,3}\.){3}\d{1,3}$)(^[a-z0-9]([a-z0-9-]*(\.[a-z0-9])?)*$)
+    Default: 'data'
+  Database:
+    Type: String
+    Description: Name of the Amazon Redshift and AWS Glue database to be created
+    Default: 'nyphil_db'
+  VPCCIDR:
+    Type: String
+    Description: CIDR for the VPC to be created
+    Default: '10.72.0.0/16'
+  SubnetACIDR:
+    Type: String
+    Description: CIDR for the first private subnet to be created
+    Default: '10.72.16.0/20'
+  SubnetBCIDR:
+    Type: String
+    Description: CIDR for the private subnet to be created
+    Default: '10.72.48.0/20'
+Mappings:
+  ParametersMap:
+    Assets:
+      S3AssetBucketName: "fna-glue-blog-useast1"
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+      - Key: Name
+        Value: !Ref VPCCIDR
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Ref VPCCIDR
+  VPCGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  SubnetAPrivate:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref SubnetACIDR
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'A private'
+      - Key: Reach
+        Value: private
+  SubnetBPrivate:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref SubnetBCIDR
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'B private'
+      - Key: Reach
+        Value: private
+  RouteTablePrivate: # should be RouteTableAPrivate, but logical id was not changed for backward compatibility
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'A Private'
+  RouteTableBPrivate:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'B Private'
+  RouteTableAssociationAPrivate:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAPrivate
+      RouteTableId: !Ref RouteTablePrivate
+  RouteTableAssociationBPrivate:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetBPrivate
+      RouteTableId: !Ref RouteTableBPrivate
+  NetworkAclPrivate:
+    Type: 'AWS::EC2::NetworkAcl'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: Private
+  SubnetNetworkAclAssociationAPrivate:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAPrivate
+      NetworkAclId: !Ref NetworkAclPrivate
+  SubnetNetworkAclAssociationBPrivate:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetBPrivate
+      NetworkAclId: !Ref NetworkAclPrivate
+  NetworkAclEntryInPrivateAllowVPC:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPrivate
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: '0.0.0.0/0'
+  NetworkAclEntryOutPrivateAllowVPC:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPrivate
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: '0.0.0.0/0'
+
+
+  # KMS encryption key
+  S3Key:
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-s3
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Join
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref 'AWS::AccountId'
+                  - ':root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow use of the key to lambda
+            Effect: Allow
+            Principal:
+              AWS:
+                - Fn::GetAtt:
+                  - LambdaExecutionRole
+                  - Arn
+            Action:
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+            Resource: '*'
+          - Sid: Allow use of the key to lambda
+            Effect: Allow
+            Principal:
+              AWS:
+                - Fn::GetAtt:
+                  - GlueExecutionRole
+                  - Arn
+            Action:
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+            Resource: '*'
+          - Sid: Allow use of the key to lambda
+            Effect: Allow
+            Principal:
+              AWS:
+                - Fn::GetAtt:
+                  - RedshiftRole
+                  - Arn
+            Action:
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+            Resource: '*'
+          - Sid: Allow VPC Flow Logs to use the key as well
+            Effect: Allow
+            Principal:
+              Service:
+                - delivery.logs.amazonaws.com
+            Action: 'kms:GenerateDataKey*'
+            Resource: '*'
+
+  S3KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/nyphil
+      TargetKeyId:
+        Ref: S3Key
+
+
+  ScriptBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            KMSMasterKeyID: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:${S3KeyAlias}'
+            SSEAlgorithm: 'aws:kms'
+      BucketName: !Join
+        - "-"
+        - - !Ref S3ScriptBucketName
+          - !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split
+                  - "/"
+                  - !Ref "AWS::StackId"
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            KMSMasterKeyID: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:${S3KeyAlias}'
+            SSEAlgorithm: 'aws:kms'
+      BucketName: !Join
+        - "-"
+        - - !Ref S3DataBucketName
+          - !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split
+                  - "/"
+                  - !Ref "AWS::StackId"
+
+  QuicksightSG:
+    Properties:
+      GroupDescription: Quicksight security group
+      SecurityGroupEgress:
+      - CidrIp: 0.0.0.0/0
+        IpProtocol: '-1'
+      VpcId:
+        Ref: VPC
+    Type: AWS::EC2::SecurityGroup
+
+  RedshiftSG:
+    Properties:
+      GroupDescription: Redshift security group
+      SecurityGroupEgress:
+      - CidrIp: 0.0.0.0/0
+        IpProtocol: '-1'
+      VpcId:
+        Ref: VPC
+    Type: AWS::EC2::SecurityGroup
+
+  InboundRuleQSRS:
+    Properties:
+      FromPort: 0
+      GroupId:
+        Fn::GetAtt:
+        - QuicksightSG
+        - GroupId
+      IpProtocol: '-1'
+      SourceSecurityGroupId:
+        Fn::GetAtt:
+        - RedshiftSG
+        - GroupId
+      ToPort: 65535
+    Type: AWS::EC2::SecurityGroupIngress
+
+  InboundRuleRS2:
+    Properties:
+      FromPort: 0
+      GroupId:
+        Fn::GetAtt:
+        - RedshiftSG
+        - GroupId
+      IpProtocol: '-1'
+      SourceSecurityGroupId:
+        Fn::GetAtt:
+        - RedshiftSG
+        - GroupId
+      ToPort: 65535
+    Type: AWS::EC2::SecurityGroupIngress
+
+  InboundRuleRSQS:
+    Properties:
+      FromPort: 0
+      GroupId:
+        Fn::GetAtt:
+        - RedshiftSG
+        - GroupId
+      IpProtocol: '-1'
+      SourceSecurityGroupId:
+        Fn::GetAtt:
+        - QuicksightSG
+        - GroupId
+      ToPort: 65535
+    Type: AWS::EC2::SecurityGroupIngress
+
+  EndpointS3:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      RouteTableIds: [!Ref RouteTablePrivate, !Ref RouteTableBPrivate]
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
+
+  EndpointSecretsManager:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PrivateDnsEnabled: True
+      SecurityGroupIds: [!Ref RedshiftSG]
+      SubnetIds: [!Ref SubnetAPrivate, !Ref SubnetBPrivate]
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  RedshiftSubnetGroup:
+    Properties:
+      Description: Subnet Group for redshift
+      SubnetIds: [!Ref SubnetAPrivate]
+    Type: AWS::Redshift::ClusterSubnetGroup
+
+  RedshiftRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: redshift.amazonaws.com
+          Sid: ''
+        Version: 2012-10-17
+    Type: AWS::IAM::Role
+
+
+  RedshiftSecret:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Name: !Ref Database
+      Description: "This is a Secrets Manager secret for Redshift"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "master"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\ '''
+
+
+  RedshiftCluster:
+    Properties:
+      ClusterSubnetGroupName:
+        Ref: RedshiftSubnetGroup
+      ClusterType: multi-node
+      DBName: !Ref Database
+      KmsKeyId: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:${S3KeyAlias}'
+      Encrypted: true
+      PubliclyAccessible: false
+      IamRoles:
+      - Fn::GetAtt:
+        - RedshiftRole
+        - Arn
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RedshiftSecret, ':SecretString:password}}' ]]
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RedshiftSecret, ':SecretString:username}}' ]]
+      NodeType: dc2.large
+      NumberOfNodes: 2
+      VpcSecurityGroupIds:
+      - Ref: RedshiftSG
+    Type: AWS::Redshift::Cluster
+
+  RedshiftPolicy:
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Action:
+          - s3:GetBucketLocation
+          - s3:GetObject
+          - s3:ListBucket
+          Effect: Allow
+          Resource:
+          - !Join ['', ['arn:aws:s3:::', !Ref ScriptBucket] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref ScriptBucket, '/*'] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref DataBucket] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref DataBucket, '/*'] ]
+        - Action:
+          - glue:CreateDatabase
+          - glue:DeleteDatabase
+          - glue:GetDatabase
+          - glue:GetDatabases
+          - glue:UpdateDatabase
+          - glue:CreateTable
+          - glue:DeleteTable
+          - glue:BatchDeleteTable
+          - glue:UpdateTable
+          - glue:GetTable
+          - glue:GetTables
+          - glue:BatchCreatePartition
+          - glue:CreatePartition
+          - glue:DeletePartition
+          - glue:BatchDeletePartition
+          - glue:UpdatePartition
+          - glue:GetPartition
+          - glue:GetPartitions
+          - glue:BatchGetPartition
+          Effect: Allow
+          Resource:
+          - '*'
+        - Action:
+          - s3:PutObject
+          - s3:DeleteObject
+          Effect: Allow
+          Resource:
+          - !Join ['', ['arn:aws:s3:::', !Ref DataBucket ]]
+          - !Join ['', ['arn:aws:s3:::', !Ref DataBucket, '/*']]
+
+      PolicyName: redshift_demo_policy_blog
+      Roles:
+      - Ref: RedshiftRole
+    Type: AWS::IAM::Policy
+
+
+
+  GlueExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  GluePolicy:
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Action:
+          - s3:GetBucketLocation
+          - s3:GetObject
+          - s3:PutObject
+          - s3:ListBucket
+          - s3:DeleteObject
+          Effect: Allow
+          Resource:
+          - !Join ['', ['arn:aws:s3:::', !Ref ScriptBucket] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref ScriptBucket, '/*'] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref DataBucket] ]
+          - !Join ['', ['arn:aws:s3:::', !Ref DataBucket, '/*'] ]
+        - Action:
+          - secretsmanager:*
+          Effect: Allow
+          Resource: !Ref RedshiftSecret
+      PolicyName: glue_demo_policy
+      Roles:
+      - Ref: GlueExecutionRole
+    Type: AWS::IAM::Policy
+
+  GlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Description: Workflow to crawl the NY Philarmonica performance data and start a job to relationalize it
+      Name: ny_phil_wf
+
+  GlueDatabaseNyPhil:
+    Type: AWS::Glue::Database
+    Properties:
+      # The database is created in the Data Catalog for your account
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        # The name of the database is defined in the Parameters section above
+        Name: !Ref Database
+        Description: Database to hold tables for NY Philarmonica data
+        LocationUri: !Ref DataBucket
+
+  GlueCrawlerSource:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: ny_phil_source_crawler
+      Role: !GetAtt GlueExecutionRole.Arn
+      #Classifiers: none, use the default classifier
+      Description: AWS Glue crawler to crawl source data for the NY Philarmonica performance
+      #Schedule: none, use default run-on-demand
+      DatabaseName: !Ref GlueDatabaseNyPhil
+      Targets:
+        S3Targets:
+          # Public S3 bucket with the flights data
+          - Path: !Sub
+            - s3://${bucket}/source-data/ny-phil-perf-hist
+            - {bucket: !Ref DataBucket}
+      #TablePrefix: 'sr_'
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Configuration: "{\"Version\":1.0,\"CrawlerOutput\":{\"Partitions\":{\"AddOrUpdateBehavior\":\"InheritFromTable\"},\"Tables\":{\"AddOrUpdateBehavior\":\"MergeNewColumns\"}}}"
+
+  GlueCrawlerDataLake:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: ny_phil_datalake_crawler
+      Role: !GetAtt GlueExecutionRole.Arn
+      #Classifiers: none, use the default classifier
+      Description: AWS Glue crawler to crawl datalake for the NY Philarmonica performance
+      #Schedule: none, use default run-on-demand
+      DatabaseName: !Ref GlueDatabaseNyPhil
+      Targets:
+        S3Targets:
+          # Public S3 bucket with the flights data
+          - Path: !Sub
+            - s3://${bucket}/data-lake
+            - {bucket: !Ref DataBucket}
+      #TablePrefix: ''
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Configuration: "{\"Version\":1.0,\"CrawlerOutput\":{\"Partitions\":{\"AddOrUpdateBehavior\":\"InheritFromTable\"},\"Tables\":{\"AddOrUpdateBehavior\":\"MergeNewColumns\"}}}"
+
+  GlueConnectionRedshift:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Description: "Connect to Redshift database."
+        ConnectionType: "JDBC"
+        #MatchCriteria: none
+        PhysicalConnectionRequirements:
+          AvailabilityZone: !Select [0, !GetAZs '']
+          SecurityGroupIdList:
+           - !Ref RedshiftSG
+          SubnetId: !Ref SubnetAPrivate
+        ConnectionProperties: {
+          "JDBC_CONNECTION_URL": !Join ['', ['jdbc:redshift://',!GetAtt RedshiftCluster.Endpoint.Address,':5439/', !Ref Database]],
+          "USERNAME": !Join ['', ['{{resolve:secretsmanager:', !Ref RedshiftSecret, ':SecretString:username}}' ]],
+          "PASSWORD": !Join ['', ['{{resolve:secretsmanager:', !Ref RedshiftSecret, ':SecretString:password}}' ]]
+        }
+        Name: ny_phil_redshift_conn
+
+  GlueJobLoadInitial:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: ny_phil_relationalize
+      Role:
+        Fn::GetAtt: [GlueExecutionRole, Arn]
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      AllocatedCapacity: 2
+      GlueVersion: 2.0
+      Connections:
+        Connections:
+        - ny_phil_redshift_conn
+      Command:
+        Name: glueetl
+        PythonVersion: 3
+        ScriptLocation: !Sub
+          - s3://${bucket}/python/flatten_join_nested_file.py
+          - {bucket: !Ref ScriptBucket}
+      DefaultArguments:
+        '--TempDir': !Sub
+          - s3://${bucket}/glue_tmp/
+          - {bucket: !Ref DataBucket}
+        "--job-bookmark-option" : "job-bookmark-disable"
+        "--s3_target_path" : !Sub
+          - s3://${bucket}/data-lake/
+          - {bucket: !Ref DataBucket}
+        "--glue_db_name" : !Ref Database
+        "--s3_temp_folder" : !Sub
+          - s3://${bucket}/tmp/
+          - {bucket: !Ref DataBucket}
+        "--glue_orig_table_name" : "ny_phil_perf_hist"
+        "--redshift_db_name" : !Ref Database
+        "--redshift_schema" : "ny_phil"
+        "--redshift_connection" : "ny_phil_redshift_conn"
+        "--root_table" : "ny_phyl_perf_hist"
+        "--lvl_to_denorm" : 0
+        "--num_output_files" : 4
+        "--keep_table_prefix" : False
+        "--target_repo" : 'all'
+        "--enable-metrics" : ""
+    DependsOn:
+      - GlueExecutionRole
+
+  GlueSourceCrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: nyphil_start_source_crawl_Trigger
+      Type: ON_DEMAND
+      Description: Source Crawler trigger
+      WorkflowName: !Ref GlueWorkflow
+      Actions:
+      - CrawlerName:
+          Ref: GlueCrawlerSource
+    DependsOn:
+      - GlueCrawlerSource
+
+  GlueJobTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: nyphil_start_relationalize_Job_Trigger
+      Type: CONDITIONAL
+      Description: Job trigger
+      WorkflowName: !Ref GlueWorkflow
+      StartOnCreation: 'true'
+      Actions:
+      - JobName: !Ref GlueJobLoadInitial
+      Predicate:
+        Conditions:
+        - LogicalOperator: EQUALS
+          CrawlerName: !Ref GlueCrawlerSource
+          CrawlState: SUCCEEDED
+        Logical: ANY
+    DependsOn:
+    - GlueJobLoadInitial
+
+  GlueDataLakeCrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: nyphil_start_dl_crawler_Trigger
+      Type: CONDITIONAL
+      Description: Data Lake Crawler trigger
+      WorkflowName: !Ref GlueWorkflow
+      StartOnCreation: 'true'
+      Actions:
+      - CrawlerName: !Ref GlueCrawlerDataLake
+      Predicate:
+        Conditions:
+        - LogicalOperator: EQUALS
+          JobName: !Ref GlueJobLoadInitial
+          State: SUCCEEDED
+        Logical: ANY
+    DependsOn:
+    - GlueJobLoadInitial
+    - GlueCrawlerDataLake
+
+  SetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt 'LambdaExecutionRole.Arn'
+      FunctionName: !Join ['-', [!Ref 'AWS::StackName','copy-scripts' ]]
+      MemorySize: 2048
+      Runtime: python3.7
+      Timeout: 300
+      Handler: index.handler
+      Code:
+        ZipFile:
+          Fn::Sub:
+          - |-
+           import json
+           import os
+           import logging
+           import cfnresponse
+           import traceback
+           import sys
+           from pip._internal import main
+           main(['install', '-I', '-q', 'boto3', '--target', '/tmp/', '--no-cache-dir', '--disable-pip-version-check'])
+           sys.path.insert(0,'/tmp/')
+           import boto3
+           LOGGER = logging.getLogger()
+           LOGGER.setLevel(logging.INFO)
+           SCRIPT_SOURCE_BUCKET = '${AssetBucket}'
+           SCRIPT_SOURCE_FOLDER = 'scripts'
+           DEST_BUCKET= '${ScriptBucket}'
+           DATA_DEST_BUCKET = '${DataBucket}'
+           ROLE_ARN = '${Role}'
+           CLUSTER_ENDPOINT = '${Endpoint}'
+           CLUSTER_ID = CLUSTER_ENDPOINT.split('.')[0]
+           ENGINE = 'redshift'
+           DB = '${DB}'
+           PORT = '5439'
+           SECRET = '${Secret}'
+           def handler(event, context):
+                LOGGER.info(event)
+                try:
+                  schema_setup(event, context)
+                except Exception as e:
+                  LOGGER.info(traceback.format_exc())
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': 'message'})
+           def schema_setup(event, context):
+               cfn_stack_id = event.get('StackId')
+               cfn_request_type = event.get('RequestType')
+               if cfn_stack_id and cfn_request_type == 'Delete':
+                   s3 = boto3.resource('s3')
+                   try:
+                       bucket = s3.Bucket(DEST_BUCKET)
+                       bucket.objects.delete()
+                       bucket = s3.Bucket(DATA_DEST_BUCKET)
+                       bucket.objects.delete()
+                       message = 'Deleted data'
+                   except botocore.exceptions.ClientError as e:
+                       error_code = int(e.response['Error']['Code'])
+                       if error_code == 404:
+                           message = 'bucket does not exist.'
+                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': message},context.log_stream_name)
+                   return {'statusCode': 200,'body': json.dumps(message)}
+               s3 = boto3.client('s3')
+               prefix = SCRIPT_SOURCE_FOLDER + '/notebooks'
+               sqlfiles = s3.list_objects_v2(Bucket=SCRIPT_SOURCE_BUCKET, Prefix = prefix)['Contents']
+               for file in sqlfiles[1:]:
+                   key = file['Key']
+                   obj = s3.get_object(Bucket=SCRIPT_SOURCE_BUCKET, Key=key)['Body'].read().decode('utf-8').replace('rolearn', ROLE_ARN).replace('bucket', DATA_DEST_BUCKET)
+                   putkey = 'notebook/' + key.split('/')[-1]
+                   response = s3.put_object(Bucket=DEST_BUCKET, Key=putkey, Body=obj)
+               prefix = SCRIPT_SOURCE_FOLDER + '/Python'
+               scriptfiles = s3.list_objects_v2(Bucket=SCRIPT_SOURCE_BUCKET, Prefix = prefix)['Contents']
+               for file in scriptfiles[1:]:
+                   key = file['Key']
+                   putkey = 'python/' + key.split('/')[-1]
+                   response = s3.copy_object(Bucket=DEST_BUCKET,Key=putkey, CopySource={'Bucket': SCRIPT_SOURCE_BUCKET,'Key':key})
+               prefix = SCRIPT_SOURCE_FOLDER + '/source-data'
+               scriptfiles = s3.list_objects_v2(Bucket=SCRIPT_SOURCE_BUCKET, Prefix = prefix)['Contents']
+               for file in scriptfiles[1:]:
+                   key = file['Key']
+                   putkey = 'source-data/ny-phil-perf-hist/' + key.split('/')[-1]
+                   response = s3.copy_object(Bucket=DATA_DEST_BUCKET,Key=putkey, CopySource={'Bucket': SCRIPT_SOURCE_BUCKET,'Key':key})
+               sm = boto3.client('secretsmanager')
+               sec = json.loads(sm.get_secret_value(SecretId=SECRET)['SecretString'])
+               sec['host'] = CLUSTER_ENDPOINT
+               sec['port'] = PORT
+               sec['engine'] = ENGINE
+               sec['dbClusterIdentifier'] = CLUSTER_ID
+               newsec = json.dumps(sec)
+               response = sm.update_secret(SecretId=SECRET, SecretString=newsec)
+               rsd = boto3.client('redshift-data')
+               response = rsd.execute_statement(
+                  ClusterIdentifier = CLUSTER_ID,
+                  SecretArn= SECRET,
+                  Database= DB,
+                  Sql='create schema ny_phil',
+                  StatementName='create_schema_ny_phil',
+                  WithEvent=True
+                  )
+               cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Ingested Data'}, context.log_stream_name)
+               return {'statusCode': 200,'body': json.dumps('Copied Files')}
+          - {
+            ScriptBucket : !Ref ScriptBucket,
+            DataBucket : !Ref DataBucket,
+            Role : !GetAtt RedshiftRole.Arn,
+            Endpoint: !GetAtt RedshiftCluster.Endpoint.Address,
+            Secret: !Ref RedshiftSecret,
+            AssetBucket: !FindInMap ["ParametersMap", "Assets", "S3AssetBucketName" ],
+            DB: !Ref Database
+            }
+    DependsOn:
+      - LambdaExecutionRole
+      - DataBucket
+      - ScriptBucket
+      - RedshiftCluster
+      - RedshiftSecret
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+      Policies:
+          -
+            PolicyName: RedshiftAccessToPublicAssetsBucket
+            PolicyDocument :
+              Version: 2012-10-17
+              Statement:
+                - Sid: RedshiftAccessToPublicAssetsBucket
+                  Effect: Allow
+                  Action:
+                    - 's3:GetObject'
+                  Resource: !Sub
+                    - "arn:aws:s3:::${S3AssetBucketName}/*"
+                    - {S3AssetBucketName: !FindInMap ["ParametersMap", "Assets", "S3AssetBucketName" ]}
+                - Sid: AllowAllUsersToListS3Bucket
+                  Effect: Allow
+                  Action:
+                    - 's3:ListBucket'
+                  Resource: !Sub
+                    - "arn:aws:s3:::${S3AssetBucketName}"
+                    - {S3AssetBucketName: !FindInMap ["ParametersMap", "Assets", "S3AssetBucketName" ]}
+
+  LambdaS3Policy:
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:PutObject
+            - s3:ListBucket
+            - s3:DeleteObject
+            Effect: Allow
+            Resource:
+            - !Join ['', ['arn:aws:s3:::', !Ref 'AWS::StackName', '*'] ]
+            - !Join ['', ['arn:aws:s3:::', !Ref 'AWS::StackName', '*', '/*'] ]
+            - !Join ['', ['arn:aws:s3:::', !Ref 'AWS::StackName', '*'] ]
+            - !Join ['', ['arn:aws:s3:::', !Ref 'AWS::StackName', '*' , '/*'] ]
+          - Action:
+            - redshift-data:ExecuteStatement
+            Effect: Allow
+            Resource:
+            - !Join ['', ['arn:aws:redshift:',!Ref 'AWS::Region',':',!Ref 'AWS::AccountId',':cluster:', !Ref 'AWS::StackName', '*'] ]
+      PolicyName: !Join ['-', [!Ref 'AWS::StackName','lambda-s3-policy' ]]
+      Roles:
+      - Ref: LambdaExecutionRole
+    Type: AWS::IAM::Policy
+
+  EnvSetup:
+    Type: 'Custom::EnvSetup'
+    DependsOn:
+      - LambdaExecutionRole
+      - DataBucket
+      - ScriptBucket
+    Properties:
+      ServiceToken: !GetAtt
+        - SetupFunction
+        - Arn
+
+Outputs:
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  AZs:
+    Description: 'AZs'
+    Value: 2
+  AZA:
+    Description: 'AZ of A'
+    Value: !Select [0, !GetAZs '']
+  AZB:
+    Description: 'AZ of B'
+    Value: !Select [1, !GetAZs '']
+  CidrBlock:
+    Description: 'The set of IP addresses for the VPC.'
+    Value: !GetAtt 'VPC.CidrBlock'
+  VPC:
+    Description: 'VPC.'
+    Value: !Ref VPC
+  SubnetAPrivate:
+    Description: 'Subnet A private.'
+    Value: !Ref SubnetAPrivate
+  SubnetBPrivate:
+    Description: 'Subnet B private.'
+    Value: !Ref SubnetBPrivate
+  RedshiftClusterEndpoint:
+    Description: Redshift Cluster endpoint
+    Value: !GetAtt RedshiftCluster.Endpoint.Address
+  RedshiftClusterPort:
+    Description: Redshift Cluster endpoint
+    Value: !GetAtt RedshiftCluster.Endpoint.Port
+  RedshiftSecret:
+    Description: Secret Manager Secret storing Redshift username and password
+    Value: !Ref RedshiftSecret
+  QuicksightSG:
+    Description: Security group for Quicksight
+    Value: !Ref QuicksightSG
+  RedshiftSG:
+    Description: Security group for Redshift
+    Value: !Ref RedshiftSG
+  ScriptBucket:
+    Description: Bucket containing Scripts and notebooks
+    Value: !Ref ScriptBucket
+  DataBucket:
+    Description: Bucket containing source data and data lake path
+    Value: !Ref DataBucket
+  GlueDatabaseNyPhil:
+    Description: AWS Glue Catalog Database Name
+    Value: !Ref GlueDatabaseNyPhil
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseNyPhil'
