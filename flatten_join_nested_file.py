@@ -279,7 +279,7 @@ for tbl_name in table_names_list:
 
     # set the number_nested_levels for this table and if the table is in the list to be denormalized
     number_nested_levels = find_tbl_nested_level(tables_to_join_map, tbl_name)[
-        'number_nested_levels']
+        'table_nested_level']
 
     for col_name in column_names_map[tbl_name]:
 
@@ -307,7 +307,7 @@ for tbl_name in table_names_list:
             # add the child table to the next level in the tables_to_join_map dictionary
             if len(tables_to_join_map) == child_tbl_join_lvl:
                 tables_to_join_map[str(child_tbl_join_lvl)] = {}
-            tables_to_join_map[str(next_join_lvl)][child_tbl_name] = {
+            tables_to_join_map[str(child_tbl_join_lvl)][child_tbl_name] = {
                 'join_to_tbls': [], 'join_col': [], 'has_child': False}
 
     # convert to Dynamicframes in preparation for write to repository
