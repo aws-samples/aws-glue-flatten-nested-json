@@ -5,6 +5,7 @@ The bulk of the of the data generated today is unstructured and, in many cases, 
 As an example of a highly nested json file that uses multiple constructs such as arrays and structs, we are using an open data set from the [New York Philharmonic performance history repository](https://github.com/nyphilarchive/PerformanceHistory). A sample json snippet from this data set illustrates below an array of structs, with multiple nesting levels:
 
 ```json
+
 {
 	"programs": [{
 		"id": "46ba9c05-6400-4337-96a1-95a91ae0f330-0.1",
@@ -43,6 +44,7 @@ As an example of a highly nested json file that uses multiple constructs such as
 		]
 	}]
 }
+
 ```
 
 
@@ -76,7 +78,8 @@ Once the stack is successfully deployed, you can review and then launch your ETL
    ![review-and-run-workflow](images/review-and-run-workflow.png)  
 4. Visualize data with simple SQL queries to analyze answer to questions like “Who were the top three Chorus soloists at New York Symphony?”
 
-		```sql
+```sql
+
 		SELECT count(1) event_count,
 		       s.soloistname
 		FROM   ny_phil.programs p
@@ -89,9 +92,9 @@ Once the stack is successfully deployed, you can review and then launch your ETL
 		       AND s.soloistroles = 'S'
 		GROUP  BY s.soloistname
 		ORDER  BY 1 DESC
-		LIMIT  3;
-		```  
+		LIMIT  3;		
 
+```
 
    ![Flattened Output Redshift](images/flattened-output-redshift.png)
 
