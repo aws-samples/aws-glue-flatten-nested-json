@@ -348,7 +348,7 @@ else:
 
         # select only the tables at a nested level equal or less to start_join_level
         if table_with_nested_level['table_nested_level'] <= start_join_level:
-            if table_with_nested_level['table_found'] == 1 and table_to_be_joined_with_level['table_nested_level'] == start_join_level:
+            if table_with_nested_level['table_found'] == 1 and table_with_nested_level['table_nested_level'] == start_join_level:
                 # if a table has been normalized convert the denormalized dataframe to dynamicFrame
                 dynamicframes_map[tbl] = DynamicFrame.fromDF(
                     denormlized_dataframe_map[tbl], glueContext, "dynamicframes_map[tbl]")
