@@ -8,8 +8,9 @@
 
 # import libraries definition
 
+from datetime import datetime
 import sys
-from awsglue.transforms import ResolveChoice, Relationalize
+from awsglue.transforms import ResolveChoice, Relationalize, DropNullFields
 from awsglue.utils import getResolvedOptions
 from awsglue.dynamicframe import DynamicFrame
 from pyspark.context import SparkContext
@@ -29,6 +30,8 @@ glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
+
+logger = glueContext.get_logger()
 
 # Current default parameters value used in the Glue job definition (change the parameters value at run time or edit the job definition to use your own):
 
@@ -51,6 +54,7 @@ job.init(args['JOB_NAME'], args)
 # target_repository = 'all'                                 Type of the repository to write the target table, default is 'all', write to S3 and Redshift;
 #                                                           set to 's3' to write only to Amazon S3 only
 #                                                           set to 'redshift' to write only to Amazon Redshift only
+#                                                           set to 'none' to simulate the job and print out the schema of the final tables only
 
 glue_db_name = args['glue_db_name']
 glue_orig_table_name = args['glue_orig_table_name']
@@ -70,21 +74,27 @@ target_repository = args['target_repo']
 dynamicframes_map = {}
 dataframes_map = {}
 s3_target_path_map = {}
-column_names_map = {}
-table_names_list = []
 datasink_map = {}
+tables_info_map = {}
 
 # variables needed to automatically denormalize the tables
 
+table_count = 0
+join_count = 0
 number_nested_levels = 0
 start_join_level = 0
 tables_to_join_map = {}
 denormlized_dataframe_map = {}
+table_with_nested_level = {}
 
 
 # helper functions definition:
 
 # Add a prefix to a name
+# helper functions definition:
+
+# Add a prefix to a name
+
 
 def add_prefix(c, prefix):
     if prefix in c:
@@ -93,19 +103,35 @@ def add_prefix(c, prefix):
         r = prefix+'_'+c
     return r
 
+# Remove a recursive suffix from a name
+
+
+def rm_suffix(name, suffix, lvl):
+    if suffix == name[len(name)-len(suffix):len(name)]:
+        lvl = lvl+1
+        name = name[0:len(name)-len(suffix)]
+        r = rm_suffix(name, suffix, lvl)
+    elif lvl > 0:
+        r = name+'_lvl'+str(lvl)
+    else:
+        r = name
+    return r
+
 # Clean a table or column name removing any glue generated strings to make the names more readable and user friendly.
 # if a column name is found in the table_name_list is treated as a foreign key and a suffix _fk is appended.
 
 
 def clean_name(name_type, tbl_name, col_name, table_name_list, text_to_replace):
     if name_type == 'table':
+        tbl_name = rm_suffix(tbl_name, '.val', 0)
         new_name = tbl_name.lower().replace(
             text_to_replace, "").replace(".", "_").replace("_val_", "_")
     elif name_type == 'column':
+        col_name = rm_suffix(col_name, '.val', 0)
         new_name = col_name.lower().replace(
             ".val.", "_").replace(".", "_").replace("__", "_")
         if new_name in table_name_list:
-            new_name = new_name+"_fk"
+            new_name = new_name+"_sk"
         elif new_name == 'id':
             new_name = tbl_name+"_sk"
         elif new_name == 'index':
@@ -117,14 +143,16 @@ def clean_name(name_type, tbl_name, col_name, table_name_list, text_to_replace):
 # Check if a column is a foreign key (it has a suffix _fk)
 
 
-def is_foreign_key(name):
-    return name[-3:] == "_fk"
+def is_foreign_key(col_name, parent_tbl_name):
+    name = col_name.replace("_sk", "")
+    if not parent_tbl_name == name:
+        return col_name[-3:] == "_sk"
 
 # Extract the table name from foreign key column
 
 
-def get_child_tbl_name(name):
-    return name.replace("_fk", "")
+def get_child_tbl_name(col_name):
+    return col_name.replace("_sk", "")
 
 # Check if the relationalized tables need to be denormalized
 
@@ -146,21 +174,122 @@ def find_tbl_nested_level(dict, tbl):
             found = 0
     return {'table_nested_level': lvl, 'table_found': found}
 
-# Recurse on the list of tables to be denormalized
-# joins tables with their parent starting from the deepest nested level (number_nested_levels)
+# leverages glue native dynamic frame writer to output the final tables to the chosen repository
+# added to avoid repeating the code and to dynamically choose the repository to write to depending on the input parameter target_repo
+
+
+def write_to_targets(tbl_name, dyn_frame, target_path, num_output_files, target_repository):
+    dyn_frame = dyn_frame.coalesce(num_output_files)
+    if target_repository == 's3' or target_repository == 'all':
+        datasink_map[tbl_name] = glueContext.write_dynamic_frame.from_options(frame=dyn_frame, connection_type="s3",
+                                                                              connection_options={
+                                                                                  "path": target_path},
+                                                                              format="glueparquet",
+                                                                              transformation_ctx="datasink_map['tbl_name']")
+
+    if target_repository == 'redshift' or target_repository == 'all':
+        db_tbl_name = redshift_schema+"."+tbl_name
+        glueContext.write_dynamic_frame.from_jdbc_conf(frame=dyn_frame,
+                                                       catalog_connection=redshift_connection,
+                                                       connection_options={
+                                                           "dbtable": db_tbl_name, "database": redshift_db_name},
+                                                       redshift_tmp_dir=s3_temp_folder)
+
+    if target_repository == 'none':
+        dfc = dyn_frame.toDF().count()
+        print('schema for table: ', tbl_name, ' number of rows: ', dfc)
+        dfs = dyn_frame.printSchema()
+        print(dfs)
+
+# Loop on the list of table's name and on each attributes to standardize all names
+# it also standardize the name of the join keys created by the  Relationalize transform
+# replacing the default name 'id' with the table name and appending the suffix "_sk"
+
+
+def prepare_write_table(tbl_name):
+
+    global table_count
+    global tables_info_map
+    global tables_to_join_map
+    global dataframes_map
+    global number_nested_levels
+    global dynamicframes_map
+
+    table_count = table_count+1
+
+    # set the number_nested_levels for this table
+    table_nested_level = tables_info_map[tbl_name]['nested_lvl']
+
+    for col_name in tables_info_map[tbl_name]['columns']:
+
+        # Clean column name and rename the dataframe attribute
+        new_col_name = clean_name(
+            'column', tbl_name, col_name, tables_info_map.keys(), '')
+        dataframes_map[tbl_name] = dataframes_map[tbl_name].withColumnRenamed(
+            col_name, new_col_name).drop('rownum')
+
+        # if the column is a foreign key and we have configured the job to run the denormalization we will add the child table to the list of tables to join
+        if is_foreign_key(new_col_name, tbl_name):
+
+            # get the child table name and join level
+            child_tbl_name = get_child_tbl_name(new_col_name)
+            child_tbl_join_lvl = table_nested_level + 1
+            number_nested_levels = max(
+                number_nested_levels, child_tbl_join_lvl)
+
+            # add the child table to the list of tables to join to for the current teable, and the foreign keys
+            tables_info_map[tbl_name]['join_to_tbls'].append(child_tbl_name)
+            tables_info_map[tbl_name]['join_col'].append(new_col_name)
+            tables_info_map[tbl_name]['has_child'] = True
+
+            tables_info_map[child_tbl_name]['nested_lvl'] = child_tbl_join_lvl
+
+            # add the child table to the next level in the tables_to_join_map dictionary
+            if len(tables_to_join_map) == child_tbl_join_lvl:
+                tables_to_join_map[str(child_tbl_join_lvl)] = {}
+            tables_to_join_map[str(child_tbl_join_lvl)][child_tbl_name] = {
+                'join_to_tbls': [], 'join_col': [], 'has_child': False}
+            prepare_write_table(child_tbl_name)
+
+    tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
+                       ][tbl_name]['join_to_tbls'] = tables_info_map[tbl_name]['join_to_tbls']
+    tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
+                       ][tbl_name]['join_col'] = tables_info_map[tbl_name]['join_col']
+    tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
+                       ][tbl_name]['has_child'] = tables_info_map[tbl_name]['has_child']
+    # convert to Dynamicframes in preparation for write to repository
+    dynamicframes_map[tbl_name] = DynamicFrame.fromDF(
+        dataframes_map[tbl_name], glueContext, "dynamicframes_map[tbl_name]")
+
+    # if no denormalization required write the data
+    if not is_to_denormalize(num_level_to_denormalize):
+        print('writing to ', target_repository)
+        write_to_targets(
+            tbl_name, dynamicframes_map[tbl_name], s3_target_path_map[tbl_name], num_output_files, target_repository)
+
+
+def print_tables_by_level():
+    print('Number of tables relationalized: ', table_count)
+    print('Number of nested levels: ', number_nested_levels)
+    for lvl, info in tables_to_join_map.items():
+        print('Nesting level: ', lvl)
+        for i in info.keys():
+            c = dataframes_map[i].count()
+            print(i, ' : ', str(c))
 
 
 def denormalize_table(tables_to_join_map, start_join_level, number_nested_levels, dataframes_map, denormlized_dataframe_map):
 
+    global join_count
     # set the next join level and start looping on all tables to be joined at the current level
     next_join_level = start_join_level+1
 
-    for left_table in tables_to_join_map[str(start_join_level)]:
+    # if the next level is not yet the last level in the nested hierarchy iterate at the next nested level
+    if next_join_level < number_nested_levels:
+        denormalize_table(tables_to_join_map, next_join_level,
+                          number_nested_levels, dataframes_map, denormlized_dataframe_map)
 
-        # if the next level is not yet the last level in the nested hierarchy iterate at the next nested level
-        if next_join_level < number_nested_levels:
-            denormalize_table(tables_to_join_map, next_join_level,
-                              number_nested_levels, dataframes_map, denormlized_dataframe_map)
+    for left_table in tables_to_join_map[str(start_join_level)]:
 
         # start the join setting the first dataframe to the one for the left_table
         df_left = dataframes_map[left_table]
@@ -170,13 +299,8 @@ def denormalize_table(tables_to_join_map, start_join_level, number_nested_levels
             for right_table in tables_to_join_map[str(start_join_level)][left_table]['join_to_tbls']:
 
                 # look up the foreign key and set it as join column for left table
-                join_col_index = tables_to_join_map[str(
-                    start_join_level)][left_table]['join_col'].index(right_table+"_fk")
-                join_col_left = tables_to_join_map[str(
-                    start_join_level)][left_table]['join_col'][join_col_index]
-
-                # set the join column for the right_table to match it with the name of the join column from the left_table
-                join_col_right = join_col_left.replace("_fk", "_sk")
+                if right_table+"_sk" in tables_to_join_map[str(start_join_level)][left_table]['join_col']:
+                    join_col = right_table+"_sk"
 
                 # if the right table had been already denormalized use that dataframe otherwise use the original dataframe
                 if right_table in denormlized_dataframe_map:
@@ -189,59 +313,74 @@ def denormalize_table(tables_to_join_map, start_join_level, number_nested_levels
                 right_cols = df_right.schema.names
 
                 for col in right_cols:
-                    if col in left_cols:
+                    if col in left_cols and not col == join_col:
                         df_right = df_right.withColumnRenamed(
                             col, right_table+"_"+col)
                         right_cols.append(right_table+"_"+col)
                         right_cols.remove(col)
 
                 # execute the join matching left and right join column names to avoid column duplication in the output dataframe
-                df_left = df_left.join(df_right.withColumnRenamed(
-                    join_col_right, join_col_left), join_col_left, how='left_outer')
+                df_left = df_left.join(df_right, join_col, how='left_outer')
+                df_joined_count = df_left.count()
+                join_count = join_count+1
+                print('join number: ', join_count)
+                print(left_table, ' left join ', right_table,
+                      'row count is: ', df_joined_count)
 
         # add the denormalized data frame to the map and continue with the loop
         denormlized_dataframe_map[left_table] = df_left
 
     return denormlized_dataframe_map
 
-# leverages glue native dynamic frame writer to output the final tables to the chosen repository
-# added to avoid repeating the code and to dynamically choose the repository to write to depending on the input parameter target_repo
-
-
-def write_to_targets(tbl_name, dyn_frame, target_path, num_output_files, target_repository):
-
-    dyn_frame = dyn_frame.coalesce(num_output_files)
-    if target_repository == 's3' or target_repository == 'all':
-        datasink_map[tbl_name] = glueContext.write_dynamic_frame.from_options(frame=dyn_frame, connection_type="s3",
-                                                                              connection_options={
-                                                                                  "path": target_path},
-                                                                              format="glueparquet",
-                                                                              transformation_ctx="datasink_map['tbl_name']")
-    if target_repository == 'redshift' or target_repository == 'all':
-        db_tbl_name = redshift_schema+"."+tbl_name
-        glueContext.write_dynamic_frame.from_jdbc_conf(frame=dyn_frame,
-                                                       catalog_connection=redshift_connection,
-                                                       connection_options={
-                                                           "dbtable": db_tbl_name, "database": redshift_db_name},
-                                                       redshift_tmp_dir=s3_temp_folder)
 
 # native AWS Glue transforms
 
 
 # read the source table from the glue catalog into a dynamicframe
+
+now = datetime.now()
+log_message = "read the source table from the glue catalog into a dynamicframe at " + \
+    now.strftime("%Y-%m-%d %H:%M:%S")
+logger.info(log_message)
+print(log_message)
+
 datasource0 = glueContext.create_dynamic_frame.from_catalog(
     database=glue_db_name, table_name=glue_orig_table_name, transformation_ctx="datasource0")
 
 # ResolveChoice.apply is usesd to eliminate ambiguity in case some attributes have different data types in different files or section of a file
+
+now = datetime.now()
+log_message = "applying ResolveChoice transform on datasource0 at " + \
+    now.strftime("%Y-%m-%d %H:%M:%S")
+logger.info(log_message)
+print(log_message)
+
 resolvechoice2 = ResolveChoice.apply(
     frame=datasource0, choice="make_struct", transformation_ctx="resolvechoice2")
+
+# DropNullFields.apply is used to drop all the fields that are always null
+
+now = datetime.now()
+log_message = "applying DropNullFields transform on resolvechoice2 at " + \
+    now.strftime("%Y-%m-%d %H:%M:%S")
+logger.info(log_message)
+print(log_message)
+
+dropnullfields3 = DropNullFields.apply(
+    frame=resolvechoice2, transformation_ctx="datasource0")
 
 # Relationalize.apply is used to un-nest the JSON files structure creating multiple dynamcic frames
 # it automatically introduces keys and foreign keys to allow to join the dynamic frames back together (creating a fully relational schema)
 # the dynamic frames generated are grouped in a dynamic frame collection
 
+now = datetime.now()
+log_message = "un-nest the JSON files structure applying Relationalize transform on dropnullfields3 at " + \
+    now.strftime("%Y-%m-%d %H:%M:%S")
+logger.info(log_message)
+print(log_message)
+
 relationalize4 = Relationalize.apply(
-    frame=resolvechoice2, staging_path=s3_temp_folder, name=root_table, transformation_ctx="relationalize4")
+    frame=dropnullfields3, staging_path=s3_temp_folder, name=root_table, transformation_ctx="relationalize4")
 
 # at this point the data is completely un-nested;
 # it could be possible to write the result in the target systems without any additional processing.
@@ -249,75 +388,62 @@ relationalize4 = Relationalize.apply(
 
 # Loop on the list of dynamic frames name and cleanse it if needed
 
+now = datetime.now()
+log_message = "running loop to cleanse table names at " + \
+    now.strftime("%Y-%m-%d %H:%M:%S")
+logger.info(log_message)
+print(log_message)
+
+text_to_replace = root_table+"_"
+
 for df_name in relationalize4.keys():
 
     if (df_name == root_table):
+        tbl_name = root_table
         if len(relationalize4.select(root_table).toDF().schema.names) == 1:
             tbl_name = relationalize4.select(root_table).toDF().schema.names[0]
-        else:
-            tbl_name = root_table
+            df_name = add_prefix(tbl_name, root_table)
+            root_table = tbl_name
+
+        tbl_join_lvl = 0
+        has_child = True
         tables_to_join_map = {
             '0': {tbl_name: {'join_to_tbls': [], 'join_col': []}}}
-        table_names_list.insert(0, tbl_name)
     else:
-        tbl_name = clean_name('table', df_name, '', [], root_table+"_")
-        if tbl_name not in table_names_list:
-            table_names_list.append(tbl_name)
+        tbl_name = clean_name('table', df_name, '', [], text_to_replace)
+        tbl_join_lvl = None
+        has_child = False
 
     # create a list of S3 output path indexed by table name
     s3_target_path_map[tbl_name] = s3_target_path+tbl_name
     # create a list of dataframes indexed by table name
     dataframes_map[tbl_name] = relationalize4.select(df_name).toDF()
     # create a list of columns indexed by table name
-    column_names_map[tbl_name] = dataframes_map[tbl_name].schema.names
+    if tbl_name not in tables_info_map:
+        tables_info_map[tbl_name] = {'columns': dataframes_map[tbl_name].schema.names,
+                                     'has_child': has_child, 'nested_lvl': tbl_join_lvl, 'join_to_tbls': [], 'join_col': []}
 
 # Loop on the list of table's name and on each attributes to standardize all names
 # it also standardize the name of the join keys created by the  Relationalize transform
 # replacing the default name 'id' with the table name and appending the suffix "_sk"
 
-for tbl_name in table_names_list:
+now = datetime.now()
+log_message = "cleansing the columns names and writing relationalized tables at " + \
+    now.strftime("%Y-%m-%d %H:%M:%S")
+logger.info(log_message)
+print(log_message)
 
-    # set the number_nested_levels for this table and if the table is in the list to be denormalized
-    number_nested_levels = find_tbl_nested_level(tables_to_join_map, tbl_name)[
-        'table_nested_level']
+prepare_write_table(root_table)
 
-    for col_name in column_names_map[tbl_name]:
+# Print out the tables that have been relationalized for each nested level
 
-        # Clean column name and rename the dataframe attribute
-        new_col_name = clean_name(
-            'column', tbl_name, col_name, table_names_list, '')
-        dataframes_map[tbl_name] = dataframes_map[tbl_name].withColumnRenamed(
-            col_name, new_col_name).drop('rownum')
+now = datetime.now()
+log_message = " Print out the tables that have been relationalized for each nested level " + \
+    now.strftime("%Y-%m-%d %H:%M:%S")
+logger.info(log_message)
+print(log_message)
 
-        # if the column is a foreign key and we have configured the job to run the denormalization we will add the child table to the list of tables to join
-        if is_foreign_key(new_col_name) and is_to_denormalize(num_level_to_denormalize):
-
-            # get the child table name and join level
-            child_tbl_name = get_child_tbl_name(new_col_name)
-            child_tbl_join_lvl = number_nested_levels+1
-
-            # add the child table to the list of tables to join to for the current teable, and the foreign keys
-            tables_to_join_map[str(number_nested_levels)][tbl_name]['join_to_tbls'].append(
-                child_tbl_name)
-            tables_to_join_map[str(number_nested_levels)][tbl_name]['join_col'].append(
-                new_col_name)
-            tables_to_join_map[str(number_nested_levels)
-                               ][tbl_name]['has_child'] = True
-
-            # add the child table to the next level in the tables_to_join_map dictionary
-            if len(tables_to_join_map) == child_tbl_join_lvl:
-                tables_to_join_map[str(child_tbl_join_lvl)] = {}
-            tables_to_join_map[str(child_tbl_join_lvl)][child_tbl_name] = {
-                'join_to_tbls': [], 'join_col': [], 'has_child': False}
-
-    # convert to Dynamicframes in preparation for write to repository
-    dynamicframes_map[tbl_name] = DynamicFrame.fromDF(
-        dataframes_map[tbl_name], glueContext, "dynamicframes_map[tbl_name]")
-
-    # if no denormalization required write the data
-    if not is_to_denormalize(num_level_to_denormalize):
-        write_to_targets(
-            tbl_name, dynamicframes_map[tbl_name], s3_target_path_map[tbl_name], num_output_files, target_repository)
+print_tables_by_level()
 
 # Optional: denormalize tables based on the parameter num_level_to_denormalize
 # !! if the json file to denormalize there might be too many joins and processing might be slow
@@ -326,9 +452,16 @@ for tbl_name in table_names_list:
 # only then select the right num_level_to_denormalize based on the use case and data model and perform the denormalization
 
 # if no denormalization needed we are done
+
 if not is_to_denormalize(num_level_to_denormalize):
     print('Job completed Successfully')
 else:
+    now = datetime.now()
+    log_message = "denormalizing tables at " + \
+        now.strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(log_message)
+    print(log_message)
+
     # select the nested level wheere to start the denormalization based on input parameter number_nested_levels
     if num_level_to_denormalize > number_nested_levels:
         start_join_level = 0
@@ -339,6 +472,12 @@ else:
     # start denormalization
     denormlized_dataframe_map = denormalize_table(
         tables_to_join_map, start_join_level, number_nested_levels, dataframes_map, denormlized_dataframe_map)
+
+    now = datetime.now()
+    log_message = "writing denormalized tables at " + \
+        now.strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(log_message)
+    print(log_message)
 
     # loop on the dynamic frames map to select the right dynamic frame to write, we need to write the denormalized dynamic frames and any dynamic frames that have not been denormalized
     for tbl in dynamicframes_map:
@@ -354,5 +493,6 @@ else:
                     denormlized_dataframe_map[tbl], glueContext, "dynamicframes_map[tbl]")
             write_to_targets(
                 tbl, dynamicframes_map[tbl], s3_target_path_map[tbl], num_output_files, target_repository)
+
 
 job.commit()
