@@ -6,16 +6,16 @@ Parameters:
     Type: String
     Description: Non existing Amazon S3 Bucket to be used to store workshop scripts
     AllowedPattern: (?!^(\d{1,3}\.){3}\d{1,3}$)(^[a-z0-9]([a-z0-9-]*(\.[a-z0-9])?)*$)
-    Default: "scripts-glue-flatten-json"
+    Default: "scripts-glue-flat-json"
   S3DataBucketName:
     Type: String
     Description: Non existing Amazon S3 Bucket to be used to store workshop data
     AllowedPattern: (?!^(\d{1,3}\.){3}\d{1,3}$)(^[a-z0-9]([a-z0-9-]*(\.[a-z0-9])?)*$)
-    Default: "data-glue-flatten-json"
+    Default: "data-glue-flat-json"
   RedshiftClusterName:
     Type: String
     Description: Name of the Amazon Redshift cluster
-    Default: "glue-flat-json-demo-cluster"
+    Default: "cluster-glue-flat-json"
   Database:
     Type: String
     Description: Name of the Amazon Redshift and AWS Glue database to be created
