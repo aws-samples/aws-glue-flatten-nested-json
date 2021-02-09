@@ -6,12 +6,12 @@ Parameters:
     Type: String
     Description: Non existing Amazon S3 Bucket to be used to store workshop scripts
     AllowedPattern: (?!^(\d{1,3}\.){3}\d{1,3}$)(^[a-z0-9]([a-z0-9-]*(\.[a-z0-9])?)*$)
-    Default: "scripts"
+    Default: "scripts-glue-flatten-json"
   S3DataBucketName:
     Type: String
     Description: Non existing Amazon S3 Bucket to be used to store workshop data
     AllowedPattern: (?!^(\d{1,3}\.){3}\d{1,3}$)(^[a-z0-9]([a-z0-9-]*(\.[a-z0-9])?)*$)
-    Default: "data"
+    Default: "data-glue-flatten-json"
   RedshiftClusterName:
     Type: String
     Description: Name of the Amazon Redshift cluster
@@ -35,7 +35,7 @@ Parameters:
   GluePrefix:
     Type: String
     Description: Name to Give to the glue connection
-    Default: "ny_phil_"
+    Default: "ny_phil"
   VPCCIDR:
     Type: String
     Description: CIDR for the VPC to be created
@@ -244,15 +244,7 @@ Resources:
           - ServerSideEncryptionByDefault:
               KMSMasterKeyID: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:${S3KeyAlias}"
               SSEAlgorithm: "aws:kms"
-      BucketName:
-        !Join [
-          "-",
-          [
-            !Ref "AWS::StackName",
-            !Ref S3ScriptBucketName,
-            !Ref "AWS::AccountId",
-          ],
-        ]
+      BucketName: !Join ["-", [!Ref S3ScriptBucketName, !Ref "AWS::AccountId"]]
 
   DataBucket:
     Type: AWS::S3::Bucket
@@ -264,11 +256,7 @@ Resources:
           - ServerSideEncryptionByDefault:
               KMSMasterKeyID: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:${S3KeyAlias}"
               SSEAlgorithm: "aws:kms"
-      BucketName:
-        !Join [
-          "-",
-          [!Ref "AWS::StackName", !Ref S3DataBucketName, !Ref "AWS::AccountId"],
-        ]
+      BucketName: !Join ["-", [!Ref S3DataBucketName, !Ref "AWS::AccountId"]]
 
   QuicksightSG:
     Properties:
@@ -465,7 +453,7 @@ Resources:
               - !Join ["", ["arn:aws:s3:::", !Ref DataBucket]]
               - !Join ["", ["arn:aws:s3:::", !Ref DataBucket, "/*"]]
 
-      PolicyName: redshift_demo_policy_blog
+      PolicyName: !Join ["-", [!Ref GluePrefix, "redshift-s3-policy"]]
       Roles:
         - Ref: RedshiftRole
     Type: AWS::IAM::Policy
@@ -507,7 +495,7 @@ Resources:
               - secretsmanager:*
             Effect: Allow
             Resource: !Ref RedshiftSecret
-      PolicyName: !Join ["-", [!Ref "AWS::StackName", "glue-s3-policy"]]
+      PolicyName: !Join ["-", [!Ref GluePrefix, "glue-s3-policy"]]
       Roles:
         - Ref: GlueExecutionRole
     Type: AWS::IAM::Policy
@@ -516,7 +504,7 @@ Resources:
     Type: AWS::Glue::Workflow
     Properties:
       Description: Workflow to crawl the NY Philarmonica performance data and start a job to relationalize it
-      Name: !Join ["", [!Ref GluePrefix, "wf"]]
+      Name: !Join ["_", [!Ref GluePrefix, "wf"]]
 
   GlueDatabaseNyPhil:
     Type: AWS::Glue::Database
@@ -532,7 +520,7 @@ Resources:
   GlueCrawlerSource:
     Type: AWS::Glue::Crawler
     Properties:
-      Name: !Join ["", [!Ref GluePrefix, "source_crawler"]]
+      Name: !Join ["_", [!Ref GluePrefix, "source_crawler"]]
       Role: !GetAtt GlueExecutionRole.Arn
       #Classifiers: none, use the default classifier
       Description: AWS Glue crawler to crawl source data for the NY Philarmonica performance
@@ -555,7 +543,7 @@ Resources:
   GlueCrawlerDataLake:
     Type: AWS::Glue::Crawler
     Properties:
-      Name: !Join ["", [!Ref GluePrefix, "datalake_crawler"]]
+      Name: !Join ["_", [!Ref GluePrefix, "datalake_crawler"]]
       Role: !GetAtt GlueExecutionRole.Arn
       #Classifiers: none, use the default classifier
       Description: AWS Glue crawler to crawl datalake for the NY Philarmonica performance
@@ -617,12 +605,12 @@ Resources:
                 ],
               ],
           }
-        Name: !Join ["", [!Ref GluePrefix, "redshift_conn"]]
+        Name: !Join ["_", [!Ref GluePrefix, "redshift_conn"]]
 
   GlueJobLoadInitial:
     Type: AWS::Glue::Job
     Properties:
-      Name: !Join ["", [!Ref GluePrefix, "relationalize"]]
+      Name: !Join ["_", [!Ref GluePrefix, "relationalize"]]
       Role:
         Fn::GetAtt: [GlueExecutionRole, Arn]
       ExecutionProperty:
@@ -631,7 +619,7 @@ Resources:
       GlueVersion: 2.0
       Connections:
         Connections:
-          - !Join ["", [!Ref GluePrefix, "redshift_conn"]]
+          - !Join ["_", [!Ref GluePrefix, "redshift_conn"]]
       Command:
         Name: glueetl
         PythonVersion: 3
@@ -653,7 +641,7 @@ Resources:
         "--glue_orig_table_name": !Ref Table
         "--redshift_db_name": !Ref Database
         "--redshift_schema": !Ref Schema
-        "--redshift_connection": !Join ["", [!Ref GluePrefix, "redshift_conn"]]
+        "--redshift_connection": !Join ["_", [!Ref GluePrefix, "redshift_conn"]]
         "--root_table": !Ref Table
         "--num_level_to_denormalize": 0
         "--num_output_files": 4
@@ -666,7 +654,7 @@ Resources:
   GlueSourceCrawlerTrigger:
     Type: AWS::Glue::Trigger
     Properties:
-      Name: !Join ["", [!Ref GluePrefix, "start_source_crawl_Trigger"]]
+      Name: !Join ["_", [!Ref GluePrefix, "start_source_crawl_Trigger"]]
       Type: ON_DEMAND
       Description: Source Crawler trigger
       WorkflowName: !Ref GlueWorkflow
@@ -698,7 +686,7 @@ Resources:
   GlueDataLakeCrawlerTrigger:
     Type: AWS::Glue::Trigger
     Properties:
-      Name: !Join ["", [!Ref GluePrefix, "start_dl_crawler_Trigger"]]
+      Name: !Join ["_", [!Ref GluePrefix, "start_dl_crawler_Trigger"]]
       Type: CONDITIONAL
       Description: Data Lake Crawler trigger
       WorkflowName: !Ref GlueWorkflow
@@ -719,7 +707,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       Role: !GetAtt "LambdaExecutionRole.Arn"
-      FunctionName: !Join ["-", [!Ref "AWS::StackName", "copy-scripts"]]
+      FunctionName: !Join ["-", [!Ref GluePrefix, "copy-scripts"]]
       MemorySize: 2048
       Runtime: python3.7
       Timeout: 300
@@ -890,8 +878,8 @@ Resources:
               - s3:DeleteObject
             Effect: Allow
             Resource:
-              - !Join ["", ["arn:aws:s3:::", !Ref "AWS::StackName", "*"]]
-              - !Join ["", ["arn:aws:s3:::", !Ref "AWS::StackName", "*", "/*"]]
+              - !Join ["", ["arn:aws:s3:::", !Ref GluePrefix, "*"]]
+              - !Join ["", ["arn:aws:s3:::", !Ref GluePrefix, "*", "/*"]]
           - Action:
               - redshift-data:ExecuteStatement
             Effect: Allow
@@ -908,7 +896,7 @@ Resources:
                     "*",
                   ],
                 ]
-      PolicyName: !Join ["-", [!Ref "AWS::StackName", "lambda-s3-policy"]]
+      PolicyName: !Join ["-", [!Ref GluePrefix, "lambda-s3-policy"]]
       Roles:
         - Ref: LambdaExecutionRole
     Type: AWS::IAM::Policy
@@ -973,5 +961,3 @@ Outputs:
   GlueDatabaseNyPhil:
     Description: AWS Glue Catalog Database Name
     Value: !Ref GlueDatabaseNyPhil
-    Export:
-      Name: !Sub "${AWS::StackName}-GlueDatabaseNyPhil"
