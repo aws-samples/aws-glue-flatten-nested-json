@@ -487,8 +487,9 @@ else:
 
         # select only the tables at a nested level equal or less to start_join_level
         if table_with_nested_level['table_nested_level'] <= start_join_level:
+            # Need to replace the dynamic frame with the denormalized on ONLY for the parent tables, this is true only for tables that satisfy both the
+            # following condition the table has childrens (table_with_nested_level['table_found'] == 1) and it is at the correct level in the nested level hierarchies ( table_with_nested_level['table_nested_level'] == start_join_level )
             if table_with_nested_level['table_found'] == 1 and table_with_nested_level['table_nested_level'] == start_join_level:
-                # if a table has been normalized convert the denormalized dataframe to dynamicFrame
                 dynamicframes_map[tbl] = DynamicFrame.fromDF(
                     denormlized_dataframe_map[tbl], glueContext, "dynamicframes_map[tbl]")
             write_to_targets(
