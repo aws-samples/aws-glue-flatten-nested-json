@@ -206,19 +206,114 @@ def write_to_targets(tbl_name, dyn_frame, target_path, num_output_files, target_
 # replacing the default name 'id' with the table name and appending the suffix "_sk"
 
 
-def prepare_write_table(tbl_name):
+def clean_tables_name(dynf_coll):
 
-    global table_count
+    global root_table
+    global tables_to_join_map
+
+    text_to_replace = root_table+"_"
+
+    print('entering clean_tables_name root_table is: ', root_table)
+
+    for df_name in dynf_coll.keys():
+
+        if (df_name == root_table):
+            tbl_name = root_table
+            if len(relationalize4.select(root_table).toDF().schema.names) == 1:
+                tbl_name = relationalize4.select(
+                    root_table).toDF().schema.names[0]
+                df_name = add_prefix(tbl_name, root_table)
+                root_table = tbl_name
+
+            tbl_join_lvl = 0
+            has_child = True
+            tables_to_join_map = {
+                '0': {tbl_name: {'join_to_tbls': [], 'join_col': []}}}
+        else:
+            tbl_name = clean_name('table', df_name, '', [], text_to_replace)
+            tbl_join_lvl = None
+            has_child = False
+
+        store_table_metadata(tbl_name, df_name, tbl_join_lvl, has_child)
+
+    print('exiting clean_tables_name root_table is: ', root_table)
+
+# function used to store information on the table of the relationalized tables and the joins
+# this maps will be used during denormalization of the table if required and later during the write phase
+
+
+def store_table_metadata(tbl_name, df_name, tbl_join_lvl, has_child):
+
     global tables_info_map
     global tables_to_join_map
     global dataframes_map
+    global s3_target_path_map
+
+    # create a list of S3 output path indexed by table name
+    s3_target_path_map[tbl_name] = s3_target_path+tbl_name
+    # create a list of dataframes indexed by table name
+    dataframes_map[tbl_name] = relationalize4.select(df_name).toDF()
+    # create a list of columns indexed by table name
+    if tbl_name not in tables_info_map:
+        tables_info_map[tbl_name] = {'columns': dataframes_map[tbl_name].schema.names,
+                                     'has_child': has_child, 'nested_lvl': tbl_join_lvl, 'join_to_tbls': [], 'join_col': []}
+
+# function used to store information on the nested levels of the relationalized tables and the joins
+# this maps will be used during denormalization of the table if required
+
+
+def store_join_metadata(obj_typ, tbl_name, new_col_name):
+
+    global tables_info_map
+    global tables_to_join_map
     global number_nested_levels
+
+    if obj_typ == 'table':
+        tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
+                           ][tbl_name]['join_to_tbls'] = tables_info_map[tbl_name]['join_to_tbls']
+        tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
+                           ][tbl_name]['join_col'] = tables_info_map[tbl_name]['join_col']
+        tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
+                           ][tbl_name]['has_child'] = tables_info_map[tbl_name]['has_child']
+
+    if obj_typ == 'column':
+
+        # set the number_nested_levels for this table
+        table_nested_level = tables_info_map[tbl_name]['nested_lvl']
+
+        # get the child table name and join level
+        child_tbl_name = get_child_tbl_name(new_col_name)
+        child_tbl_join_lvl = table_nested_level + 1
+        number_nested_levels = max(
+            number_nested_levels, child_tbl_join_lvl)
+
+        # add the child table to the list of tables to join to for the current teable, and the foreign keys
+        tables_info_map[tbl_name]['join_to_tbls'].append(child_tbl_name)
+        tables_info_map[tbl_name]['join_col'].append(new_col_name)
+        tables_info_map[tbl_name]['has_child'] = True
+
+        tables_info_map[child_tbl_name]['nested_lvl'] = child_tbl_join_lvl
+
+        # add the child table to the next level in the tables_to_join_map dictionary
+        if len(tables_to_join_map) == child_tbl_join_lvl:
+            tables_to_join_map[str(child_tbl_join_lvl)] = {}
+        tables_to_join_map[str(child_tbl_join_lvl)][child_tbl_name] = {
+            'join_to_tbls': [], 'join_col': [], 'has_child': False}
+
+        return child_tbl_name
+
+# Loop on the list of table's name and on each attributes to standardize all names
+# it also standardize the name of the join keys created by the  Relationalize transform
+# replacing the default name 'id' with the table name and appending the suffix "_sk"
+
+
+def clean_columns_name(tbl_name, tables_info_map):
+
+    global table_count
+    global dataframes_map
     global dynamicframes_map
 
     table_count = table_count+1
-
-    # set the number_nested_levels for this table
-    table_nested_level = tables_info_map[tbl_name]['nested_lvl']
 
     for col_name in tables_info_map[tbl_name]['columns']:
 
@@ -231,41 +326,16 @@ def prepare_write_table(tbl_name):
         # if the column is a foreign key and we have configured the job to run the denormalization we will add the child table to the list of tables to join
         if is_foreign_key(new_col_name, tbl_name):
 
-            # get the child table name and join level
-            child_tbl_name = get_child_tbl_name(new_col_name)
-            child_tbl_join_lvl = table_nested_level + 1
-            number_nested_levels = max(
-                number_nested_levels, child_tbl_join_lvl)
+            child_tbl_name = store_join_metadata(
+                'column', tbl_name, new_col_name)
 
-            # add the child table to the list of tables to join to for the current teable, and the foreign keys
-            tables_info_map[tbl_name]['join_to_tbls'].append(child_tbl_name)
-            tables_info_map[tbl_name]['join_col'].append(new_col_name)
-            tables_info_map[tbl_name]['has_child'] = True
+            clean_columns_name(child_tbl_name, tables_info_map)
 
-            tables_info_map[child_tbl_name]['nested_lvl'] = child_tbl_join_lvl
+    store_join_metadata('table', tbl_name, '')
 
-            # add the child table to the next level in the tables_to_join_map dictionary
-            if len(tables_to_join_map) == child_tbl_join_lvl:
-                tables_to_join_map[str(child_tbl_join_lvl)] = {}
-            tables_to_join_map[str(child_tbl_join_lvl)][child_tbl_name] = {
-                'join_to_tbls': [], 'join_col': [], 'has_child': False}
-            prepare_write_table(child_tbl_name)
-
-    tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
-                       ][tbl_name]['join_to_tbls'] = tables_info_map[tbl_name]['join_to_tbls']
-    tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
-                       ][tbl_name]['join_col'] = tables_info_map[tbl_name]['join_col']
-    tables_to_join_map[str(tables_info_map[tbl_name]['nested_lvl'])
-                       ][tbl_name]['has_child'] = tables_info_map[tbl_name]['has_child']
     # convert to Dynamicframes in preparation for write to repository
     dynamicframes_map[tbl_name] = DynamicFrame.fromDF(
         dataframes_map[tbl_name], glueContext, "dynamicframes_map[tbl_name]")
-
-    # if no denormalization required write the data
-    if not is_to_denormalize(num_level_to_denormalize):
-        print('writing to ', target_repository)
-        write_to_targets(
-            tbl_name, dynamicframes_map[tbl_name], s3_target_path_map[tbl_name], num_output_files, target_repository)
 
 
 def print_tables_by_level():
@@ -394,34 +464,7 @@ log_message = "running loop to cleanse table names at " + \
 logger.info(log_message)
 print(log_message)
 
-text_to_replace = root_table+"_"
-
-for df_name in relationalize4.keys():
-
-    if (df_name == root_table):
-        tbl_name = root_table
-        if len(relationalize4.select(root_table).toDF().schema.names) == 1:
-            tbl_name = relationalize4.select(root_table).toDF().schema.names[0]
-            df_name = add_prefix(tbl_name, root_table)
-            root_table = tbl_name
-
-        tbl_join_lvl = 0
-        has_child = True
-        tables_to_join_map = {
-            '0': {tbl_name: {'join_to_tbls': [], 'join_col': []}}}
-    else:
-        tbl_name = clean_name('table', df_name, '', [], text_to_replace)
-        tbl_join_lvl = None
-        has_child = False
-
-    # create a list of S3 output path indexed by table name
-    s3_target_path_map[tbl_name] = s3_target_path+tbl_name
-    # create a list of dataframes indexed by table name
-    dataframes_map[tbl_name] = relationalize4.select(df_name).toDF()
-    # create a list of columns indexed by table name
-    if tbl_name not in tables_info_map:
-        tables_info_map[tbl_name] = {'columns': dataframes_map[tbl_name].schema.names,
-                                     'has_child': has_child, 'nested_lvl': tbl_join_lvl, 'join_to_tbls': [], 'join_col': []}
+clean_tables_name(relationalize4)
 
 # Loop on the list of table's name and on each attributes to standardize all names
 # it also standardize the name of the join keys created by the  Relationalize transform
@@ -433,7 +476,7 @@ log_message = "cleansing the columns names and writing relationalized tables at 
 logger.info(log_message)
 print(log_message)
 
-prepare_write_table(root_table)
+clean_columns_name(root_table, tables_info_map)
 
 # Print out the tables that have been relationalized for each nested level
 
@@ -453,47 +496,52 @@ print_tables_by_level()
 
 # if no denormalization needed we are done
 
-if not is_to_denormalize(num_level_to_denormalize):
-    print('Job completed Successfully')
-else:
+if is_to_denormalize(num_level_to_denormalize):
+
     now = datetime.now()
-    log_message = "denormalizing tables at " + \
+    log_message = "startdenormalizing table(s) at " + \
         now.strftime("%Y-%m-%d %H:%M:%S")
     logger.info(log_message)
     print(log_message)
 
     # select the nested level wheere to start the denormalization based on input parameter number_nested_levels
-    if num_level_to_denormalize > number_nested_levels:
-        start_join_level = 0
-    else:
+    if num_level_to_denormalize < number_nested_levels:
         start_join_level = (number_nested_levels - num_level_to_denormalize)
-        print('start denormalizing table(s)')
 
     # start denormalization
     denormlized_dataframe_map = denormalize_table(
         tables_to_join_map, start_join_level, number_nested_levels, dataframes_map, denormlized_dataframe_map)
 
-    now = datetime.now()
-    log_message = "writing denormalized tables at " + \
-        now.strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(log_message)
-    print(log_message)
+now = datetime.now()
+log_message = "writing tables at " + \
+    now.strftime("%Y-%m-%d %H:%M:%S")
+logger.info(log_message)
+print(log_message)
 
-    # loop on the dynamic frames map to select the right dynamic frame to write, we need to write the denormalized dynamic frames and any dynamic frames that have not been denormalized
-    for tbl in dynamicframes_map:
+# loop on the dynamic frames map to select the right dynamic frame to write, we need to write the denormalized dynamic frames and any dynamic frames that have not been denormalized
+for tbl in dynamicframes_map:
+
+    is_table_to_write = True
+
+    if is_to_denormalize(num_level_to_denormalize):
         # find the table nested level number and if the table has been denormalized or not
         table_with_nested_level = find_tbl_nested_level(
             tables_to_join_map, tbl)
 
-        # select only the tables at a nested level equal or less to start_join_level
-        if table_with_nested_level['table_nested_level'] <= start_join_level:
-            # Need to replace the dynamic frame with the denormalized on ONLY for the parent tables, this is true only for tables that satisfy both the
-            # following condition the table has childrens (table_with_nested_level['table_found'] == 1) and it is at the correct level in the nested level hierarchies ( table_with_nested_level['table_nested_level'] == start_join_level )
-            if table_with_nested_level['table_found'] == 1 and table_with_nested_level['table_nested_level'] == start_join_level:
-                dynamicframes_map[tbl] = DynamicFrame.fromDF(
-                    denormlized_dataframe_map[tbl], glueContext, "dynamicframes_map[tbl]")
-            write_to_targets(
-                tbl, dynamicframes_map[tbl], s3_target_path_map[tbl], num_output_files, target_repository)
+        # select only the tables at a nested level equal or less to start_join_level to write them out; need to replace the dynamic frame with the denormalized on ONLY for the parent tables,
+        # this is true only for tables that satisfy both the following conditions:
+        # 1. the table has childrens (table_with_nested_level['table_found'] == 1)
+        # 2. it is at the correct level in the nested level hierarchies ( table_with_nested_level['table_nested_level'] == start_join_level )
+
+        if table_with_nested_level['table_found'] == 1 and table_with_nested_level['table_nested_level'] == start_join_level:
+            dynamicframes_map[tbl] = DynamicFrame.fromDF(
+                denormlized_dataframe_map[tbl], glueContext, "dynamicframes_map[tbl]")
+        elif table_with_nested_level['table_nested_level'] > start_join_level:
+            is_table_to_write = False
+
+    if is_table_to_write:
+        write_to_targets(
+            tbl, dynamicframes_map[tbl], s3_target_path_map[tbl], num_output_files, target_repository)
 
 
 job.commit()
