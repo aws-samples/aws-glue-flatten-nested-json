@@ -219,8 +219,8 @@ def clean_tables_name(dynf_coll):
 
         if (df_name == root_table):
             tbl_name = root_table
-            if len(relationalize4.select(root_table).toDF().schema.names) == 1:
-                tbl_name = relationalize4.select(
+            if len(dynf_coll.select(root_table).toDF().schema.names) == 1:
+                tbl_name = dynf_coll.select(
                     root_table).toDF().schema.names[0]
                 df_name = add_prefix(tbl_name, root_table)
                 root_table = tbl_name
@@ -234,7 +234,8 @@ def clean_tables_name(dynf_coll):
             tbl_join_lvl = None
             has_child = False
 
-        store_table_metadata(tbl_name, df_name, tbl_join_lvl, has_child)
+        store_table_metadata(tbl_name, dynf_coll, df_name,
+                             tbl_join_lvl, has_child)
 
     print('exiting clean_tables_name root_table is: ', root_table)
 
@@ -242,7 +243,7 @@ def clean_tables_name(dynf_coll):
 # this maps will be used during denormalization of the table if required and later during the write phase
 
 
-def store_table_metadata(tbl_name, df_name, tbl_join_lvl, has_child):
+def store_table_metadata(tbl_name, dynf_coll, df_name, tbl_join_lvl, has_child):
 
     global tables_info_map
     global tables_to_join_map
@@ -252,7 +253,7 @@ def store_table_metadata(tbl_name, df_name, tbl_join_lvl, has_child):
     # create a list of S3 output path indexed by table name
     s3_target_path_map[tbl_name] = s3_target_path+tbl_name
     # create a list of dataframes indexed by table name
-    dataframes_map[tbl_name] = relationalize4.select(df_name).toDF()
+    dataframes_map[tbl_name] = dynf_coll.select(df_name).toDF()
     # create a list of columns indexed by table name
     if tbl_name not in tables_info_map:
         tables_info_map[tbl_name] = {'columns': dataframes_map[tbl_name].schema.names,
