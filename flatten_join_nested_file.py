@@ -404,6 +404,21 @@ def denormalize_table(tables_to_join_map, start_join_level, number_nested_levels
     return denormlized_dataframe_map
 
 
+def clean_table_data(tbl_df):
+    cols = []
+    print(tbl_df.columns)
+    print(tbl_df.count())
+    for col in tbl_df.columns:
+        if "_sk" not in col:
+            cols.append(col)
+    print(cols)
+    tbl_df_drop_duplicates = tbl_df.dropDuplicates(cols)
+    print(tbl_df_drop_duplicates.count())
+    tbl_df_drop_nulls = tbl_df_drop_duplicates.na.drop(subset=cols)
+    print(tbl_df_drop_nulls.count())
+    return tbl_df_drop_nulls
+
+
 # native AWS Glue transforms
 
 
@@ -541,6 +556,7 @@ for tbl in dynamicframes_map:
             is_table_to_write = False
 
     if is_table_to_write:
+        dynamicframes_map[tbl] = DynamicFrame.fromDF(clean_table_data(dynamicframes_map[tbl].toDF()), glueContext, "dynamicframes_map[tbl]")
         write_to_targets(
             tbl, dynamicframes_map[tbl], s3_target_path_map[tbl], num_output_files, target_repository)
 
