@@ -21,7 +21,7 @@ from awsglue.job import Job
 # Parameters mapping : retrieve the parameters passed to the Glue job and store them in the array "args"
 
 args = getResolvedOptions(sys.argv, ['JOB_NAME', 'glue_db_name', 'glue_orig_table_name', 's3_temp_folder',
-                                     's3_target_path', 'root_table', 'redshift_connection', 'redshift_db_name', 'redshift_schema', 'num_level_to_denormalize', 'num_output_files', 'keep_table_prefix', 'target_repo'])
+                                     's3_target_path', 'root_table', 'redshift_connection', 'redshift_db_name', 'redshift_schema', 'num_level_to_denormalize', 'num_output_files', 'target_repo'])
 
 # Spark and Glue context initialization:
 
@@ -66,7 +66,7 @@ redshift_schema = args['redshift_schema']
 root_table = args['root_table']
 num_level_to_denormalize = int(args['num_level_to_denormalize'])
 num_output_files = int(args['num_output_files'])
-keep_table_prefix = args['keep_table_prefix']
+keep_table_prefix = 0
 target_repository = args['target_repo']
 
 # additional variable inizialization:
@@ -419,6 +419,14 @@ def clean_table_data(tbl_df):
     return tbl_df_drop_nulls
 
 
+def drop_foreign_keys(tbl_df):
+    cols = []
+    for col in tbl_df.columns:
+        if "_sk" in col:
+            cols.append(col)
+    tbl_df_drop_sk = tbl_df.drop(*cols)
+    return tbl_df_drop_sk
+
 # native AWS Glue transforms
 
 
@@ -557,6 +565,8 @@ for tbl in dynamicframes_map:
 
     if is_table_to_write:
         dynamicframes_map[tbl] = DynamicFrame.fromDF(clean_table_data(dynamicframes_map[tbl].toDF()), glueContext, "dynamicframes_map[tbl]")
+        if num_level_to_denormalize >= number_nested_levels:
+            dynamicframes_map[tbl] = DynamicFrame.fromDF(drop_foreign_keys(dynamicframes_map[tbl].toDF()), glueContext, "dynamicframes_map[tbl]")
         write_to_targets(
             tbl, dynamicframes_map[tbl], s3_target_path_map[tbl], num_output_files, target_repository)
 
