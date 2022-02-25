@@ -429,7 +429,7 @@ def drop_foreign_keys(tbl_df):
     tbl_df_drop_sk = tbl_df.drop(*cols)
     return tbl_df_drop_sk
 
-
+# pivot tags
 def clean_tags(tbl_df):
     pivot_df = tbl_df.filter((col("key") == "product") | \
                         (col("key") == "component") | \
