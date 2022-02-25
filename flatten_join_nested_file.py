@@ -16,6 +16,8 @@ from awsglue.dynamicframe import DynamicFrame
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
+from pyspark.sql.functions import first
+from pyspark.sql.functions import col
 
 
 # Parameters mapping : retrieve the parameters passed to the Glue job and store them in the array "args"
@@ -427,6 +429,17 @@ def drop_foreign_keys(tbl_df):
     tbl_df_drop_sk = tbl_df.drop(*cols)
     return tbl_df_drop_sk
 
+
+def clean_tags(tbl_df):
+    pivot_df = tbl_df.filter((col("key") == "product") | \
+                        (col("key") == "component") | \
+                        (col("key") == "asset") | \
+                        (col("key") == "service") | \
+                        (col("key") == "service-short")).groupby("id").pivot("key").agg(first("value"))
+    joined_df = pivot_df.join(tbl_df, "id", "outer").drop(*["key", "value"]).dropDuplicates()
+    return joined_df
+
+
 # native AWS Glue transforms
 
 
@@ -566,9 +579,10 @@ for tbl in dynamicframes_map:
     if is_table_to_write:
         dynamicframes_map[tbl] = DynamicFrame.fromDF(clean_table_data(dynamicframes_map[tbl].toDF()), glueContext, "dynamicframes_map[tbl]")
         if num_level_to_denormalize >= number_nested_levels:
-            dynamicframes_map[tbl] = DynamicFrame.fromDF(drop_foreign_keys(dynamicframes_map[tbl].toDF()), glueContext, "dynamicframes_map[tbl]")
+            dynamicframes_map[tbl] = DynamicFrame.fromDF(clean_tags(drop_foreign_keys(dynamicframes_map[tbl].toDF())), glueContext, "dynamicframes_map[tbl]")
         write_to_targets(
             tbl, dynamicframes_map[tbl], s3_target_path_map[tbl], num_output_files, target_repository)
 
 
 job.commit()
+
