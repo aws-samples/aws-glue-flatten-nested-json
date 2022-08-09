@@ -239,6 +239,8 @@ Resources:
     DeletionPolicy: Delete
     Properties:
       AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -251,6 +253,8 @@ Resources:
     DeletionPolicy: Delete
     Properties:
       AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
